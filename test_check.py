@@ -15,7 +15,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from check import KST, judge, load_repos, parse_repo_url, parse_time
+from check import (KST, judge, load_repos, mark_shared_repos,
+                   parse_repo_url, parse_time)
 
 DEADLINE = datetime.datetime(2026, 8, 21, 10, 0, 0, tzinfo=KST)
 
@@ -352,6 +353,45 @@ def test_unreachable_repo():
 def test_missing_pushed_at_is_not_a_violation():
     """시각을 모르면 위반으로 몰지 않는다. 억울한 탈락보다 누락이 낫다."""
     assert judge(_info(pushed_at=None), DEADLINE)[0] == "정상"
+
+
+# ── 팀 간 레포 중복 ──────────────────────────────────────────────
+
+def test_shared_repo_across_teams_is_flagged():
+    """다른 두 팀이 같은 레포를 내면 양쪽 다 확인 대상으로 올린다.
+
+    한 팀이 프론트·백엔드에 같은 주소를 넣는 건 정상(한 레포로 개발)이라
+    load_repos에서 이미 걸러진다. 여기 오는 중복은 팀이 다른 경우뿐이다.
+    """
+    results = [
+        ("정상", "OO대 · 알파팀", "shared/repo", "마감 전 푸시", []),
+        ("정상", "XX대 · 베타팀", "shared/repo", "마감 전 푸시", []),
+        ("정상", "YY대 · 감마팀", "own/repo", "마감 전 푸시", []),
+    ]
+    out = mark_shared_repos(results)
+    by_team = {t: (g, s, ln) for g, t, _, s, ln in out}
+
+    g, summary, lines = by_team["OO대 · 알파팀"]
+    assert g == "확인필요", "정상이어도 리포트에 올라와야 한다"
+    assert "레포 중복" in summary, summary
+    assert any("XX대 · 베타팀" in ln for ln in lines), lines
+
+    g, _, lines = by_team["XX대 · 베타팀"]
+    assert g == "확인필요"
+    assert any("OO대 · 알파팀" in ln for ln in lines), "상대 팀 이름이 나와야 한다"
+
+    assert by_team["YY대 · 감마팀"][0] == "정상", "겹치지 않는 팀은 그대로"
+
+
+def test_shared_repo_keeps_worse_grade():
+    """이미 위반인 항목을 중복 표시 때문에 등급이 내려가면 안 된다."""
+    out = mark_shared_repos([
+        ("위반", "A팀", "shared/repo", "마감 후 커밋 3건", ["증거"]),
+        ("정상", "B팀", "shared/repo", "마감 전 푸시", []),
+    ])
+    grades = {t: g for g, t, _, _, _ in out}
+    assert grades["A팀"] == "위반", grades
+    assert grades["B팀"] == "확인필요", grades
 
 
 # ── 시각 ─────────────────────────────────────────────────────────

@@ -680,6 +680,36 @@ def compare_one(owner, name, before, deadline):
     return worst, "스냅샷 이후 " + ", ".join(bits), lines
 
 
+def mark_shared_repos(results):
+    """서로 다른 팀이 같은 레포를 낸 경우를 리포트 항목으로 올린다.
+
+    한 팀이 프론트·백엔드 칸에 같은 주소를 넣는 건 정상이다 — 한 레포로
+    개발했으면 그렇게 넣으라고 안내했다. **다른 팀끼리 겹치는 게 이상한 것**이라
+    그쪽만 표시한다. 팀 안의 중복은 load_repos에서 이미 걸러져 여기 오지 않는다.
+
+    시작할 때 경고로만 찍으면 600개를 도는 동안 스크롤로 지나가 버린다.
+    등급을 올려서 리포트와 CSV에 남긴다.
+    """
+    by_repo = {}
+    for _, team, repo, _, _ in results:
+        by_repo.setdefault(repo.lower(), set()).add(team)
+
+    out = []
+    for grade, team, repo, summary, lines in results:
+        others = sorted(by_repo.get(repo.lower(), set()) - {team})
+        if not others:
+            out.append((grade, team, repo, summary, lines))
+            continue
+        shown = ", ".join(others[:5]) + (f" 외 {len(others) - 5}팀"
+                                         if len(others) > 5 else "")
+        lines = list(lines) + [f"같은 레포를 제출한 다른 팀: {shown}"]
+        summary = f"{summary} / 다른 팀 {len(others)}곳과 레포 중복"
+        if grade == "정상":
+            grade = "확인필요"
+        out.append((grade, team, repo, summary, lines))
+    return out
+
+
 # ── 리포트 ───────────────────────────────────────────────────────
 
 RANK = {"위반": 0, "확인필요": 1, "오류": 2, "정상": 3}
@@ -871,7 +901,8 @@ def main():
             g, s, ln = compare_one(owner, name, before[(owner, name)], deadline)
             return (g, team, f"{owner}/{name}", s, ln)
 
-        results = normalize(run_concurrent(rows, work, args.workers, "대조"))
+        results = mark_shared_repos(
+            normalize(run_concurrent(rows, work, args.workers, "대조")))
         text = report(results, deadline, "스냅샷 대조")
     else:
         source = args.repos
@@ -894,22 +925,15 @@ def main():
         if not rows:
             p.error("읽을 수 있는 레포 주소가 없습니다")
 
-        # 서로 다른 팀이 같은 레포를 냈으면 알린다. 표절·복사이거나
-        # 제출 실수인데, 둘 다 사람이 봐야 하는 일이다.
+        # 상세는 리포트에 항목으로 나온다. 여기선 네트워크를 타기 전에
+        # 규모만 미리 알린다 — 수십 건이면 목록 자체가 잘못됐을 수 있다.
         by_repo = {}
         for team, owner, name, _ in rows:
             by_repo.setdefault((owner.lower(), name.lower()), set()).add(team)
-        shared = {k: v for k, v in by_repo.items() if len(v) > 1}
-        if shared:
-            print("", file=sys.stderr)
-            print(f"[주의] 여러 팀이 같은 레포를 제출했습니다 ({len(shared)}건)",
-                  file=sys.stderr)
-            for (o, n), teams in list(shared.items())[:10]:
-                print(f"  {o}/{n}  <-  " + ", ".join(sorted(teams)),
-                      file=sys.stderr)
-            if len(shared) > 10:
-                print(f"  ... 외 {len(shared) - 10}건", file=sys.stderr)
-            print("", file=sys.stderr)
+        n_shared = sum(1 for v in by_repo.values() if len(v) > 1)
+        if n_shared:
+            print(f"[주의] 여러 팀이 같은 레포를 제출했습니다 — {n_shared}건 "
+                  "(리포트에 팀 이름이 나옵니다)", file=sys.stderr)
 
         print(f"레포 {len(rows)}개를 읽었습니다"
               + (f" (읽지 못한 행 {len(bad)}개)" if bad else ""),
@@ -928,7 +952,8 @@ def main():
             g, s, ln = judge(info, deadline)
             return (g, team, f"{owner}/{name}", s, ln)
 
-        results = normalize(run_concurrent(rows, work, args.workers, "검사"))
+        results = mark_shared_repos(
+            normalize(run_concurrent(rows, work, args.workers, "검사")))
         text = report(results, deadline, "사후 검사")
 
     print("\n" + text)
