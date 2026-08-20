@@ -4,12 +4,13 @@
     python test_check.py      (의존성 0)
     pytest test_check.py
 
-URL 파싱과 판정 로직만 본다. API 호출은 테스트하지 않는다 —
+입력 파싱(txt/csv/xlsx)과 판정 로직만 본다. API 호출은 테스트하지 않는다 —
 깃허브 응답을 흉내 낸 딕셔너리를 judge()에 직접 넣는다.
 """
 
 import datetime
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -51,34 +52,159 @@ def test_url_rejects_non_github():
         assert parse_repo_url(raw) is None, raw
 
 
+def test_url_rejects_slashy_text():
+    """슬래시가 들어간 아무 문자열이나 레포로 읽으면 안 된다.
+
+    엑셀 메모 칸의 "제출 마감 8/21 09:59:59"가 레포로 잡혀
+    [오류] 행이 됐던 적이 있다. 600행짜리 표에서 이런 게 수십 건 나오면
+    진짜 오류가 그 속에 묻힌다. 깃허브 이름은 영숫자와 . _ - 뿐이다.
+    """
+    for raw in ["제출 마감 8/21 09:59:59", "8/21", "확인 완료/미완료",
+                "OO대/XX대 공동", "2026/08/21", "https://github.com/한글/레포"]:
+        assert parse_repo_url(raw) is None, raw
+
+
 def test_url_keeps_case():
     """깃허브는 대소문자를 보존한다. 임의로 소문자화하면 표시가 틀어진다."""
     assert parse_repo_url("https://github.com/MyTeam/MyProj") == ("MyTeam", "MyProj")
 
 
-def test_load_repos(tmp_path=None):
+# ── 텍스트·CSV 입력 ──────────────────────────────────────────────
+
+def _write(lines, suffix=".txt"):
+    with tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False,
+                                     encoding="utf-8", newline="") as f:
+        f.write("\n".join(lines) + "\n")
+        return f.name
+
+
+def test_load_repos():
     """팀명 + 여러 URL, 주석, 빈 줄, 중복 URL을 한 파일에서 처리한다."""
-    import tempfile
-    body = (
-        "# 주석\n"
-        "\n"
-        "팀하나, https://github.com/a/front, https://github.com/a/back\n"
-        "https://github.com/b/solo\n"
-        "한레포팀, https://github.com/c/mono, https://github.com/c/mono\n"
-        "이건 주소가 없는 줄\n"
-    )
-    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False,
-                                     encoding="utf-8") as f:
-        f.write(body)
-        path = f.name
+    path = _write([
+        "# 주석",
+        "",
+        "팀하나, https://github.com/a/front, https://github.com/a/back",
+        "https://github.com/b/solo",
+        "한레포팀, https://github.com/c/mono, https://github.com/c/mono",
+        "팀명,프론트엔드,백엔드",                    # 머리글 — 조용히 넘겨야 한다
+        "깨진팀, https://github.com/owner만있음",    # 주소를 적으려다 실패 — 보고
+    ])
     rows, bad = load_repos(path)
     got = [(t, o, n) for t, o, n, _ in rows]
-    assert ("팀하나", "a", "front") in got
-    assert ("팀하나", "a", "back") in got
+    assert ("팀하나", "a", "front") in got, got
+    assert ("팀하나", "a", "back") in got, got
     assert ("b/solo", "b", "solo") in got, "팀명이 없으면 owner/repo로 채운다"
     # 프론트·백엔드 칸에 같은 레포를 넣으라고 안내했으므로 중복이 정상 유입된다
     assert sum(1 for t, o, n in got if n == "mono") == 1, "중복 URL은 한 번만"
-    assert len(bad) == 1, "읽지 못한 줄은 보고해야 한다"
+    assert len(bad) == 1, f"실패한 주소만 보고해야 한다: {bad}"
+    assert "owner만있음" in bad[0][1]
+
+
+def test_quoted_comma_in_team_name():
+    """팀명에 쉼표가 들어가면 따옴표로 묶여 온다. split(',')로는 행이 깨진다."""
+    path = _write(['"멋사, 서울", https://github.com/x/y'], ".csv")
+    rows, _ = load_repos(path)
+    assert rows and rows[0][0] == "멋사, 서울", rows
+
+
+def test_header_row_is_silent():
+    """600행짜리 엑셀의 머리글까지 경고하면 진짜 오류가 그 속에 묻힌다."""
+    path = _write(["팀명,프론트,백엔드", "", "메모: 확인 요망"])
+    rows, bad = load_repos(path)
+    assert rows == [] and bad == [], (rows, bad)
+
+
+# ── 엑셀 입력 ────────────────────────────────────────────────────
+
+def _make_xlsx(path, rows, hyperlink=None):
+    """openpyxl 없이 최소 xlsx를 만든다. 읽기 쪽을 진짜 파일로 검증하려고."""
+    import zipfile
+    from xml.sax.saxutils import escape
+
+    shared, idx = [], {}
+    for r in rows:
+        for c in r:
+            if c not in idx:
+                idx[c] = len(shared)
+                shared.append(c)
+
+    body = []
+    for ri, r in enumerate(rows, 1):
+        cs = "".join(f'<c r="{chr(ord("A") + ci)}{ri}" t="s"><v>{idx[c]}</v></c>'
+                     for ci, c in enumerate(r))
+        body.append(f'<row r="{ri}">{cs}</row>')
+
+    links = ""
+    rels = ('<?xml version="1.0"?><Relationships xmlns='
+            '"http://schemas.openxmlformats.org/package/2006/relationships">')
+    if hyperlink:
+        ref, target = hyperlink
+        links = f'<hyperlinks><hyperlink ref="{ref}" r:id="rId9"/></hyperlinks>'
+        rels += ('<Relationship Id="rId9" Type="http://schemas.openxmlformats.org'
+                 '/officeDocument/2006/relationships/hyperlink" '
+                 f'Target="{escape(target)}" TargetMode="External"/>')
+    rels += "</Relationships>"
+
+    sheet = ('<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats'
+             '.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats'
+             '.org/officeDocument/2006/relationships"><sheetData>'
+             + "".join(body) + "</sheetData>" + links + "</worksheet>")
+    ss = ('<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org'
+          f'/spreadsheetml/2006/main" count="{len(shared)}" '
+          f'uniqueCount="{len(shared)}">'
+          + "".join(f"<si><t>{escape(x)}</t></si>" for x in shared) + "</sst>")
+
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("[Content_Types].xml",
+                   '<?xml version="1.0"?><Types xmlns="http://schemas.'
+                   'openxmlformats.org/package/2006/content-types"/>')
+        z.writestr("_rels/.rels",
+                   '<?xml version="1.0"?><Relationships xmlns="http://schemas.'
+                   'openxmlformats.org/package/2006/relationships"/>')
+        z.writestr("xl/workbook.xml",
+                   '<?xml version="1.0"?><workbook xmlns="http://schemas.'
+                   'openxmlformats.org/spreadsheetml/2006/main"/>')
+        z.writestr("xl/sharedStrings.xml", ss)
+        z.writestr("xl/worksheets/sheet1.xml", sheet)
+        if hyperlink:
+            z.writestr("xl/worksheets/_rels/sheet1.xml.rels", rels)
+    return path
+
+
+def test_xlsx_any_column_layout():
+    """엑셀은 열 순서가 매번 다르다. 위치를 고정하지 않고 모든 칸을 훑는다.
+
+    첫 열이 '번호'인 표가 흔한데, 그냥 첫 칸을 팀명으로 쓰면
+    리포트에 팀명이 "3"으로 찍혀 어느 팀인지 알 수 없게 된다.
+    """
+    path = tempfile.mktemp(suffix=".xlsx")
+    _make_xlsx(path, [
+        ["번호", "팀명", "학교", "프론트", "백엔드", "비고"],   # 머리글
+        ["1", "멋사팀", "OO대", "https://github.com/a/front",
+         "https://github.com/a/back", "확인함"],
+        ["2", "둘째팀", "XX대", "", "https://github.com/b/only", ""],
+        ["3", "메모", "", "", "", "제출 마감 8/21 09:59:59"],  # 날짜는 레포 아님
+    ])
+    rows, bad = load_repos(path)
+    got = [(t, o, n) for t, o, n, _ in rows]
+    assert ("멋사팀", "a", "front") in got, got
+    assert ("멋사팀", "a", "back") in got, got
+    assert ("둘째팀", "b", "only") in got, got
+    assert bad == [], bad
+
+
+def test_xlsx_reads_hyperlink_target():
+    """셀엔 '레포 링크'만 보이고 실제 주소는 관계 파일에 있는 경우.
+
+    구글시트에서 내보낸 xlsx가 이렇다. 셀 값만 읽으면 그 팀이 통째로 빠지는데,
+    빠진 줄도 모른다 — 경고 없이 검사 대상에서 사라진다.
+    """
+    path = tempfile.mktemp(suffix=".xlsx")
+    _make_xlsx(path, [["링크팀", "레포 링크"]],
+               hyperlink=("B1", "https://github.com/hidden/repo"))
+    rows, _ = load_repos(path)
+    got = [(o, n) for _, o, n, _ in rows]
+    assert ("hidden", "repo") in got, got
 
 
 # ── 판정 ─────────────────────────────────────────────────────────
@@ -118,6 +244,19 @@ def test_commits_after_deadline():
     assert g == "위반"
     assert "1건" in s
     assert any("abc12345" in ln for ln in lines)
+
+
+def test_many_commits_are_capped():
+    """레포 하나가 커밋 200건을 쏟아내면 리포트를 못 읽는다."""
+    many = [{"sha": f"sha{i:05d}", "branch": "main",
+             "authored": "2026-08-21T04:00:00Z",
+             "committed": f"2026-08-21T04:{i:02d}:00Z",
+             "author": "학생", "message": f"작업 {i}"} for i in range(40)]
+    g, s, lines = judge(_info(pushed_at="2026-08-21T05:00:00Z", commits=many),
+                        DEADLINE)
+    assert "40건" in s, "요약에는 전체 건수가 남아야 한다"
+    assert len(lines) < 20, f"근거 줄이 잘려야 한다: {len(lines)}"
+    assert any("외 30건" in ln for ln in lines), lines
 
 
 def test_pushed_after_but_no_commits():

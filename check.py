@@ -33,6 +33,7 @@ import csv
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -40,6 +41,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
 API = "https://api.github.com"
@@ -57,6 +60,12 @@ DEFAULT_WORKERS = 8
 
 # 레포 하나가 마감 후 커밋 200건을 쏟아내면 리포트를 못 읽는다.
 MAX_COMMIT_LINES = 10
+
+# 커밋을 끝까지 긁으면 브랜치 20개짜리 레포 하나가 검사 전체를 멈춘다.
+# 위반을 보이는 데는 몇 건이면 충분하고, 표시도 10건까지만 한다.
+# 잘라낸 사실은 리포트에 남긴다 — 조용히 자르면 "다 봤다"로 읽힌다.
+MAX_COMMIT_PAGES = 2        # 브랜치당 최대 200건
+MAX_BRANCHES_SCANNED = 30   # 기본 브랜치를 먼저 보고, 나머지는 여기까지
 
 
 # ── 시각 ─────────────────────────────────────────────────────────
@@ -178,22 +187,28 @@ def api(path, params=None):
     raise RuntimeError(f"4회 실패: {path}")
 
 
-def api_all(path, params=None):
-    """페이지를 끝까지 따라가며 합친다."""
+def api_all(path, params=None, max_pages=20):
+    """페이지를 따라가며 합친다. (결과, 더_있음)을 돌려준다."""
     out, page = [], 1
     while True:
         data, _ = api(path, {**(params or {}), "per_page": 100, "page": page})
         if not isinstance(data, list) or not data:
-            return out
+            return out, False
         out.extend(data)
         if len(data) < 100:
-            return out
+            return out, False
         page += 1
-        if page > 20:  # 브랜치 2000개는 비정상 — 무한루프 방지
-            return out
+        if page > max_pages:
+            return out, True
 
 
 # ── 입력 ─────────────────────────────────────────────────────────
+
+# 깃허브 계정·레포 이름은 영숫자와 . _ - 만 쓸 수 있다.
+# 이 검사가 없으면 슬래시가 든 아무 문자열이나 레포가 된다 —
+# 엑셀 메모 칸의 "제출 마감 8/21 09:59:59"가 레포로 잡힌 적이 있다.
+_NAME_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
 
 def parse_repo_url(raw):
     """어떤 형태로 적혀 오든 (owner, name)으로. 못 읽으면 None.
@@ -205,16 +220,20 @@ def parse_repo_url(raw):
     if not s:
         return None
     s = s.split("#")[0].split("?")[0].strip()
+    had_host = False
     if s.startswith("git@"):
         s = s.split(":", 1)[-1]
+        had_host = True
     for prefix in ("https://", "http://", "ssh://", "git://"):
         if s.lower().startswith(prefix):
             s = s[len(prefix):]
+            had_host = True
             break
     if s.lower().startswith("www."):
         s = s[4:]
     if s.lower().startswith("github.com/"):
         s = s[len("github.com/"):]
+        had_host = True
     elif "/" in s and "." in s.split("/")[0]:
         return None  # 깃허브가 아닌 호스트
     parts = [p for p in s.split("/") if p]
@@ -223,41 +242,133 @@ def parse_repo_url(raw):
     owner, name = parts[0], parts[1]
     if name.lower().endswith(".git"):
         name = name[:-4]
-    if not owner or not name:
+    if not _NAME_OK.match(owner) or not _NAME_OK.match(name):
+        return None
+    # 호스트가 안 적힌 `owner/repo` 축약형은 글자가 하나라도 있어야 받는다.
+    # 안 그러면 엑셀의 날짜 "8/21", "2026/08"이 전부 레포가 된다.
+    if not had_host and not (any(c.isalpha() for c in owner)
+                             and any(c.isalpha() for c in name)):
         return None
     return owner, name
 
 
+_XL = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_ODOC = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+
+
+def _xlsx_rows(path):
+    """.xlsx를 표준 라이브러리만으로 읽는다. (행번호, [셀문자열]) 을 흘린다.
+
+    openpyxl을 쓰면 편하지만 의존성 0을 깨고 싶지 않았다.
+    xlsx는 XML을 담은 zip이라 zipfile + ElementTree로 충분하다.
+
+    열 위치를 정해두지 않는다. 제출 폼에서 뽑은 엑셀은 열이 20개일 수도,
+    순서가 매번 다를 수도 있어서 **모든 셀을 훑어 깃허브 주소를 찾는다.**
+    """
+    with zipfile.ZipFile(path) as z:
+        names = set(z.namelist())
+
+        shared = []
+        if "xl/sharedStrings.xml" in names:
+            root = ET.fromstring(z.read("xl/sharedStrings.xml"))
+            for si in root.findall(f"{_XL}si"):
+                shared.append("".join(t.text or "" for t in si.iter(f"{_XL}t")))
+
+        sheets = sorted(n for n in names
+                        if n.startswith("xl/worksheets/sheet") and n.endswith(".xml"))
+        for sheet in sheets:
+            root = ET.fromstring(z.read(sheet))
+
+            # 하이퍼링크는 셀 값이 아니라 관계 파일에 들어 있다. 셀에 '링크'라고만
+            # 보이고 실제 주소는 여기 있는 경우가 흔하다 (구글시트에서 내보낸 파일).
+            relpath = sheet.replace("xl/worksheets/", "xl/worksheets/_rels/") + ".rels"
+            relmap = {}
+            if relpath in names:
+                for r in ET.fromstring(z.read(relpath)):
+                    relmap[r.get("Id")] = r.get("Target") or ""
+            links = {}
+            for h in root.iter(f"{_XL}hyperlink"):
+                target = relmap.get(h.get(f"{_ODOC}id")) or h.get("location") or ""
+                ref = (h.get("ref") or "").split(":")[0]
+                if ref and target:
+                    links[ref] = target
+
+            for n, row in enumerate(root.iter(f"{_XL}row"), 1):
+                cells = []
+                for c in row.findall(f"{_XL}c"):
+                    kind, val = c.get("t"), ""
+                    if kind == "s":
+                        v = c.find(f"{_XL}v")
+                        if v is not None and (v.text or "").strip().isdigit():
+                            i = int(v.text)
+                            val = shared[i] if i < len(shared) else ""
+                    elif kind == "inlineStr":
+                        node = c.find(f"{_XL}is")
+                        if node is not None:
+                            val = "".join(x.text or "" for x in node.iter(f"{_XL}t"))
+                    else:
+                        v = c.find(f"{_XL}v")
+                        val = (v.text or "") if v is not None else ""
+                    cells.append(val.strip())
+                    ref = c.get("r") or ""
+                    if ref in links:          # 표시 글자와 실제 주소가 다를 수 있다
+                        cells.append(links[ref].strip())
+                yield int(row.get("r") or n), cells
+
+
+def _source_rows(path):
+    """입력 파일 → (행번호, [셀문자열]). xlsx와 txt/csv를 같은 모양으로 맞춘다."""
+    if path.lower().endswith((".xlsx", ".xlsm")):
+        yield from _xlsx_rows(path)
+        return
+    # csv.reader를 쓰는 이유: 팀명에 쉼표가 있으면 따옴표로 묶여 오는데
+    # split(",")로 자르면 그 행이 통째로 깨진다.
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        for lineno, cells in enumerate(csv.reader(f), 1):
+            yield lineno, [c.strip() for c in cells]
+
+
+def _looks_like_attempt(cells):
+    """주소를 적으려다 실패한 행인지. 머리글·빈 행까지 경고하면 600행에서 시끄럽다."""
+    joined = " ".join(cells).lower()
+    return "github" in joined or "http" in joined or ".git" in joined
+
+
 def load_repos(path):
     """입력 파일 → [(팀명, owner, name, 원문)]. 중복 레포는 전체에서 한 번만.
+
+    .txt/.csv/.xlsx를 모두 받는다. 열 순서를 고정하지 않고 **모든 셀에서
+    깃허브 주소를 찾아내고, 같은 행의 주소가 아닌 첫 칸을 팀명으로 쓴다.**
+    제출 폼에서 뽑은 엑셀은 열 구성이 매번 달라서 이렇게 해야 안 깨진다.
 
     한 레포로 개발한 팀은 프론트·백엔드 칸에 같은 URL을 넣게 되어 있어서
     (그렇게 안내됐다) 중복이 정상적으로 들어온다. 600개 중 상당수가
     이런 중복이라 여기서 걸러야 호출 수가 줄어든다.
     """
     rows, bad, seen = [], [], set()
-    with open(path, encoding="utf-8-sig") as f:
-        for lineno, line in enumerate(f, 1):
-            line = line.strip()
-            if not line or line.startswith("#"):
+    for lineno, cells in _source_rows(path):
+        cells = [c for c in cells if c]
+        if not cells or cells[0].startswith("#"):
+            continue
+        team, urls = "", []
+        for c in cells:
+            if parse_repo_url(c):
+                urls.append(c)
+            elif not team and not c.isdigit():
+                # 숫자만 있는 칸은 건너뛴다. 제출 표의 첫 열이 대개 '번호'라
+                # 그냥 첫 칸을 쓰면 팀명이 "3"으로 찍힌다.
+                team = c
+        if not urls:
+            if _looks_like_attempt(cells):
+                bad.append((lineno, ", ".join(cells)[:100]))
+            continue
+        for u in urls:
+            owner, name = parse_repo_url(u)
+            key = (owner.lower(), name.lower())
+            if key in seen:
                 continue
-            cells = [c.strip() for c in line.split(",")]
-            team, urls = "", []
-            for c in cells:
-                if parse_repo_url(c):
-                    urls.append(c)
-                elif not team and c:
-                    team = c
-            if not urls:
-                bad.append((lineno, line))
-                continue
-            for u in urls:
-                owner, name = parse_repo_url(u)
-                key = (owner.lower(), name.lower())
-                if key in seen:
-                    continue
-                seen.add(key)
-                rows.append((team or f"{owner}/{name}", owner, name, u))
+            seen.add(key)
+            rows.append((team or f"{owner}/{name}", owner, name, u))
     return rows, bad
 
 
@@ -267,7 +378,8 @@ def fetch(owner, name, deadline, want_commits=True):
     """레포 하나의 상태. 네트워크가 닿는 유일한 곳이다."""
     info = {"owner": owner, "name": name, "ok": False, "err": None,
             "private": None, "default_branch": None, "pushed_at": None,
-            "branches": {}, "commits": [], "seen_at": None}
+            "branches": {}, "commits": [], "seen_at": None,
+            "truncated": []}
     try:
         repo, _ = api(f"/repos/{owner}/{name}")
     except NotFound:
@@ -284,7 +396,8 @@ def fetch(owner, name, deadline, want_commits=True):
                 seen_at=datetime.datetime.now(UTC).isoformat())
 
     try:
-        for b in api_all(f"/repos/{owner}/{name}/branches"):
+        branches, _ = api_all(f"/repos/{owner}/{name}/branches")
+        for b in branches:
             info["branches"][b["name"]] = b["commit"]["sha"]
     except Exception as e:
         # 브랜치를 못 받으면 스냅샷이 반쪽이라 대조가 무의미해진다.
@@ -298,10 +411,22 @@ def fetch(owner, name, deadline, want_commits=True):
     pushed = parse_time(info["pushed_at"])
     if want_commits and pushed and pushed >= deadline:
         seen = set()
-        for branch in info["branches"]:
+        # 기본 브랜치를 먼저 본다. 뒤에서 잘려도 평가 기준 브랜치는 남는다.
+        ordered = sorted(info["branches"],
+                         key=lambda b: b != info["default_branch"])
+        if len(ordered) > MAX_BRANCHES_SCANNED:
+            info["truncated"].append(
+                f"브랜치 {len(ordered)}개 중 {MAX_BRANCHES_SCANNED}개만 확인")
+            ordered = ordered[:MAX_BRANCHES_SCANNED]
+        for branch in ordered:
             try:
-                for c in api_all(f"/repos/{owner}/{name}/commits",
-                                 {"sha": branch, "since": api_time(deadline)}):
+                got, more = api_all(f"/repos/{owner}/{name}/commits",
+                                    {"sha": branch, "since": api_time(deadline)},
+                                    max_pages=MAX_COMMIT_PAGES)
+                if more:
+                    info["truncated"].append(
+                        f"[{branch}] 커밋이 너무 많아 앞부분만 확인")
+                for c in got:
                     if c["sha"] in seen:
                         continue
                     seen.add(c["sha"])
@@ -399,6 +524,8 @@ def judge(info, deadline):
                      f"{c['author']}  {c['message']}{note}")
     if len(ordered) > MAX_COMMIT_LINES:
         lines.append(f"... 외 {len(ordered) - MAX_COMMIT_LINES}건 (CSV로 전체 확인)")
+    for t in info.get("truncated") or []:
+        lines.append(f"(주의: {t})")
     return "위반", f"마감 후 커밋 {len(ordered)}건", lines
 
 
