@@ -741,10 +741,29 @@ def do_snapshot(rows, deadline, path, workers, resume):
 
 # ── CLI ──────────────────────────────────────────────────────────
 
+def find_input():
+    """현재 폴더에서 입력 파일을 찾는다.
+
+    마감 직후에 파일명을 잘못 쳐서 헤매는 상황을 막으려는 것이다.
+    후보가 하나면 그걸 쓰고, 여럿이면 골라 달라고 하고 멈춘다 —
+    임의로 하나를 집으면 엉뚱한 파일로 검사하고도 모른다.
+    """
+    skip = ("repos.example.txt", "requirements.txt")
+    cands = sorted(
+        f for f in os.listdir(".")
+        if f.lower().endswith((".xlsx", ".xlsm", ".csv", ".txt"))
+        and f not in skip and not f.startswith("~$")   # ~$ = 엑셀 열어둔 임시파일
+        and not f.lower().startswith("result")
+    )
+    return cands
+
+
 def main():
     global TOKEN
     p = argparse.ArgumentParser(description="제출 레포의 마감 후 커밋 검사")
-    p.add_argument("repos", nargs="?", help="레포 목록 파일 (URL 한 줄에 하나)")
+    p.add_argument("repos", nargs="?",
+                   help="엑셀(.xlsx)이나 목록 파일(.csv/.txt). "
+                        "생략하면 현재 폴더에서 찾는다")
     p.add_argument("--deadline", default=DEFAULT_DEADLINE,
                    help=f"마감 시각, KST 기준 (기본 {DEFAULT_DEADLINE})")
     p.add_argument("--snapshot", metavar="FILE",
@@ -781,13 +800,29 @@ def main():
         results = normalize(run_concurrent(rows, work, args.workers, "대조"))
         text = report(results, deadline, "스냅샷 대조")
     else:
-        if not args.repos:
-            p.error("레포 목록 파일이 필요합니다 (또는 --compare)")
-        rows, bad = load_repos(args.repos)
+        source = args.repos
+        if not source:
+            cands = find_input()
+            if len(cands) == 1:
+                source = cands[0]
+                print(f"입력 파일: {source}", file=sys.stderr)
+            elif not cands:
+                p.error("이 폴더에 입력 파일이 없습니다. 엑셀(.xlsx)이나 "
+                        "목록 파일(.csv/.txt)을 이 폴더에 넣거나 경로를 적어주세요.")
+            else:
+                # 임의로 하나를 집으면 엉뚱한 파일로 검사하고도 모른다.
+                p.error("입력 파일이 여러 개라 무엇을 쓸지 모르겠습니다: "
+                        + ", ".join(cands)
+                        + "  ->  하나를 지정해주세요: python check.py 파일이름")
+        rows, bad = load_repos(source)
         for lineno, line in bad:
             print(f"경고: {lineno}행을 읽지 못했습니다 — {line}", file=sys.stderr)
         if not rows:
             p.error("읽을 수 있는 레포 주소가 없습니다")
+
+        print(f"레포 {len(rows)}개를 읽었습니다"
+              + (f" (읽지 못한 행 {len(bad)}개)" if bad else ""),
+              file=sys.stderr)
 
         if args.snapshot:
             return do_snapshot(rows, deadline, args.snapshot,

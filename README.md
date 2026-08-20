@@ -8,10 +8,21 @@
 
 ## 준비
 
-**`.xlsx` 엑셀 파일을 그대로 넣으면 된다.** `.csv`와 `.txt`도 받는다.
+**받은 엑셀 파일을 이 폴더에 그대로 넣기만 하면 된다.** 파일명은 아무래도 좋다.
 
 ```bash
-python check.py submissions.xlsx --snapshot snapshot-0821.json
+python check.py --snapshot snapshot-0821.json
+```
+
+파일명을 안 적으면 이 폴더에서 `.xlsx` / `.csv` / `.txt`를 찾아 쓴다.
+마감 직후에 파일명 오타로 헤매지 않으려는 것이다. 어떤 파일을 골랐는지
+`입력 파일: ...`로 알려주고, **후보가 여럿이면 임의로 고르지 않고 멈춘다** —
+엉뚱한 파일로 검사하고도 모르는 것보다 낫다.
+
+파일이 다른 곳에 있으면 경로를 적어도 된다.
+
+```bash
+python check.py "C:/Users/신상현/Downloads/제출목록.xlsx" --snapshot snapshot-0821.json
 ```
 
 **열 순서를 맞출 필요가 없다.** 모든 칸을 훑어 깃허브 주소를 찾고, 같은 행에서
