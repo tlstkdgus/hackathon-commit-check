@@ -256,6 +256,19 @@ _XL = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 _ODOC = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 
 
+def _col_index(ref):
+    """셀 참조("AD5") → 0부터 세는 열 번호. 못 읽으면 None."""
+    n = 0
+    for ch in ref:
+        if ch.isalpha():
+            n = n * 26 + (ord(ch.upper()) - 64)
+        elif n:
+            break
+        else:
+            return None
+    return n - 1 if n else None
+
+
 def _xlsx_rows(path):
     """.xlsx를 표준 라이브러리만으로 읽는다. (행번호, [셀문자열]) 을 흘린다.
 
@@ -294,7 +307,10 @@ def _xlsx_rows(path):
                     links[ref] = target
 
             for n, row in enumerate(root.iter(f"{_XL}row"), 1):
-                cells = []
+                # 빈 셀은 XML에 아예 없다. <c>를 순서대로 담으면 열이 밀려서
+                # 머리글로 잡은 '팀명' 열이 엉뚱한 값을 가리키게 된다.
+                # r 속성("AD5")으로 실제 열 위치에 넣는다.
+                slots, extra = {}, []
                 for c in row.findall(f"{_XL}c"):
                     kind, val = c.get("t"), ""
                     if kind == "s":
@@ -309,11 +325,17 @@ def _xlsx_rows(path):
                     else:
                         v = c.find(f"{_XL}v")
                         val = (v.text or "") if v is not None else ""
-                    cells.append(val.strip())
                     ref = c.get("r") or ""
-                    if ref in links:          # 표시 글자와 실제 주소가 다를 수 있다
-                        cells.append(links[ref].strip())
-                yield int(row.get("r") or n), cells
+                    ci = _col_index(ref)
+                    if ci is None:
+                        extra.append(val.strip())
+                    else:
+                        slots[ci] = val.strip()
+                    # 하이퍼링크 대상은 열 정렬을 깨지 않게 행 끝에 붙인다
+                    if ref in links:
+                        extra.append(links[ref].strip())
+                width = max(slots) + 1 if slots else 0
+                yield int(row.get("r") or n), [slots.get(i, "") for i in range(width)] + extra
 
 
 def _source_rows(path):
@@ -334,48 +356,100 @@ def _looks_like_attempt(cells):
     return "github" in joined or "http" in joined or ".git" in joined
 
 
+_TEAM_H = ("팀명", "팀이름", "팀", "team", "teamname")
+_SCHOOL_H = ("대학명", "학교명", "대학", "학교", "소속", "university")
+
+
+def _header_columns(cells):
+    """머리글 행에서 팀명·대학명 열 위치를 찾는다.
+
+    제출 플랫폼에서 뽑은 표는 첫 열이 '대학명'이고 팀명은 네 번째다.
+    머리글을 안 보고 '주소 아닌 첫 칸'을 쓰면 리포트가 전부 대학명으로
+    찍혀서 같은 학교의 여러 팀을 구분할 수 없다.
+    """
+    team = school = None
+    for i, c in enumerate(cells):
+        n = c.strip().lower().replace(" ", "")
+        if team is None and n in _TEAM_H:
+            team = i
+        if school is None and n in _SCHOOL_H:
+            school = i
+    return team, school
+
+
 def load_repos(path):
-    """입력 파일 → [(팀명, owner, name, 원문)]. 중복 레포는 전체에서 한 번만.
+    """입력 파일 → [(팀, owner, name, 원문)].
 
-    .txt/.csv/.xlsx를 모두 받는다. 열 순서를 고정하지 않고 **모든 셀에서
-    깃허브 주소를 찾아내고, 같은 행의 주소가 아닌 첫 칸을 팀명으로 쓴다.**
-    제출 폼에서 뽑은 엑셀은 열 구성이 매번 달라서 이렇게 해야 안 깨진다.
+    .txt/.csv/.xlsx를 모두 받는다. 머리글에 '팀명'/'대학명'이 있으면 그 열을
+    쓰고, 없으면 주소가 아닌 첫 칸을 팀명으로 쓴다(숫자만 있는 '번호' 열은 건너뜀).
 
-    한 레포로 개발한 팀은 프론트·백엔드 칸에 같은 URL을 넣게 되어 있어서
-    (그렇게 안내됐다) 중복이 정상적으로 들어온다. 600개 중 상당수가
-    이런 중복이라 여기서 걸러야 호출 수가 줄어든다.
+    **중복 제거는 팀 안에서만 한다.** 한 레포로 개발한 팀이 프론트·백엔드 칸에
+    같은 주소를 넣는 건 정상이라 걸러야 하지만, 서로 다른 두 팀이 같은 레포를
+    냈다면 그건 지워선 안 되는 정보다. 전역으로 지우면 뒤에 나온 팀이
+    검사 목록에서 조용히 사라진다.
     """
     rows, bad, seen = [], [], set()
+    team_i = school_i = None
+    first = True
     for lineno, cells in _source_rows(path):
-        cells = [c for c in cells if c]
-        if not cells or cells[0].startswith("#"):
+        if first:
+            first = False
+            t, sc = _header_columns(cells)
+            if t is not None or sc is not None:
+                team_i, school_i = t, sc
+                continue                      # 머리글 행은 데이터가 아니다
+        filled = [c for c in cells if c]
+        if not filled or filled[0].startswith("#"):
             continue
-        team, urls = "", []
-        for c in cells:
-            if parse_repo_url(c):
-                urls.append(c)
-            elif not team and not c.isdigit():
-                # 숫자만 있는 칸은 건너뛴다. 제출 표의 첫 열이 대개 '번호'라
-                # 그냥 첫 칸을 쓰면 팀명이 "3"으로 찍힌다.
-                team = c
+
+        label = ""
+        if team_i is not None or school_i is not None:
+            parts = [cells[i] for i in (school_i, team_i)
+                     if i is not None and i < len(cells) and cells[i]]
+            label = " · ".join(parts)
+        if not label:
+            for c in filled:
+                if not c.isdigit() and not parse_repo_url(c):
+                    label = c
+                    break
+
+        urls = [c for c in filled if parse_repo_url(c)]
         if not urls:
-            if _looks_like_attempt(cells):
-                bad.append((lineno, ", ".join(cells)[:100]))
+            if _looks_like_attempt(filled):
+                bad.append((lineno, ", ".join(filled)[:100]))
             continue
         for u in urls:
             owner, name = parse_repo_url(u)
-            key = (owner.lower(), name.lower())
+            key = (label, owner.lower(), name.lower())
             if key in seen:
                 continue
             seen.add(key)
-            rows.append((team or f"{owner}/{name}", owner, name, u))
+            rows.append((label or f"{owner}/{name}", owner, name, u))
     return rows, bad
 
 
 # ── 수집 ─────────────────────────────────────────────────────────
 
+_cache = {}
+_cache_lock = threading.Lock()
+
+
 def fetch(owner, name, deadline, want_commits=True):
-    """레포 하나의 상태. 네트워크가 닿는 유일한 곳이다."""
+    """레포 하나의 상태. 네트워크가 닿는 유일한 곳이다.
+
+    같은 레포를 여러 팀이 냈으면 팀마다 보고하되 조회는 한 번만 한다.
+    """
+    ck = (owner.lower(), name.lower(), want_commits)
+    with _cache_lock:
+        if ck in _cache:
+            return _cache[ck]
+    info = _fetch_uncached(owner, name, deadline, want_commits)
+    with _cache_lock:
+        _cache[ck] = info
+    return info
+
+
+def _fetch_uncached(owner, name, deadline, want_commits=True):
     info = {"owner": owner, "name": name, "ok": False, "err": None,
             "private": None, "default_branch": None, "pushed_at": None,
             "branches": {}, "commits": [], "seen_at": None,
@@ -819,6 +893,23 @@ def main():
             print(f"경고: {lineno}행을 읽지 못했습니다 — {line}", file=sys.stderr)
         if not rows:
             p.error("읽을 수 있는 레포 주소가 없습니다")
+
+        # 서로 다른 팀이 같은 레포를 냈으면 알린다. 표절·복사이거나
+        # 제출 실수인데, 둘 다 사람이 봐야 하는 일이다.
+        by_repo = {}
+        for team, owner, name, _ in rows:
+            by_repo.setdefault((owner.lower(), name.lower()), set()).add(team)
+        shared = {k: v for k, v in by_repo.items() if len(v) > 1}
+        if shared:
+            print("", file=sys.stderr)
+            print(f"[주의] 여러 팀이 같은 레포를 제출했습니다 ({len(shared)}건)",
+                  file=sys.stderr)
+            for (o, n), teams in list(shared.items())[:10]:
+                print(f"  {o}/{n}  <-  " + ", ".join(sorted(teams)),
+                      file=sys.stderr)
+            if len(shared) > 10:
+                print(f"  ... 외 {len(shared) - 10}건", file=sys.stderr)
+            print("", file=sys.stderr)
 
         print(f"레포 {len(rows)}개를 읽었습니다"
               + (f" (읽지 못한 행 {len(bad)}개)" if bad else ""),

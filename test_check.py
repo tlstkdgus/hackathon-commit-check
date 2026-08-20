@@ -171,26 +171,79 @@ def _make_xlsx(path, rows, hyperlink=None):
     return path
 
 
-def test_xlsx_any_column_layout():
-    """엑셀은 열 순서가 매번 다르다. 위치를 고정하지 않고 모든 칸을 훑는다.
+def test_xlsx_uses_header_to_find_team_column():
+    """머리글에 '팀명'이 있으면 그 열을 쓴다.
 
-    첫 열이 '번호'인 표가 흔한데, 그냥 첫 칸을 팀명으로 쓰면
-    리포트에 팀명이 "3"으로 찍혀 어느 팀인지 알 수 없게 된다.
+    제출 플랫폼 표는 첫 열이 '대학명'이고 팀명은 네 번째다. 머리글을 안 보고
+    '주소 아닌 첫 칸'을 쓰면 리포트가 전부 대학명으로 찍혀서, 같은 학교의
+    여러 팀을 구분할 수 없다. 실제 파일에서 그렇게 나왔다.
     """
     path = tempfile.mktemp(suffix=".xlsx")
     _make_xlsx(path, [
-        ["번호", "팀명", "학교", "프론트", "백엔드", "비고"],   # 머리글
-        ["1", "멋사팀", "OO대", "https://github.com/a/front",
-         "https://github.com/a/back", "확인함"],
-        ["2", "둘째팀", "XX대", "", "https://github.com/b/only", ""],
-        ["3", "메모", "", "", "", "제출 마감 8/21 09:59:59"],  # 날짜는 레포 아님
+        ["대학명", "서비스명", "트랙", "팀명", "GitHub BE", "GitHub FE"],
+        ["OO대", "서비스가", "AAC", "알파팀",
+         "https://github.com/a/back", "https://github.com/a/front"],
+        ["OO대", "서비스나", "SJF", "베타팀", "https://github.com/b/only", ""],
     ])
     rows, bad = load_repos(path)
     got = [(t, o, n) for t, o, n, _ in rows]
-    assert ("멋사팀", "a", "front") in got, got
-    assert ("멋사팀", "a", "back") in got, got
-    assert ("둘째팀", "b", "only") in got, got
+    assert ("OO대 · 알파팀", "a", "back") in got, got
+    assert ("OO대 · 알파팀", "a", "front") in got, got
+    # 같은 대학의 다른 팀이 구분돼야 한다
+    assert ("OO대 · 베타팀", "b", "only") in got, got
     assert bad == [], bad
+
+
+def test_same_repo_from_different_teams_is_kept():
+    """서로 다른 팀이 같은 레포를 냈으면 둘 다 남겨야 한다.
+
+    전역 중복제거를 하면 뒤에 나온 팀이 검사 목록에서 조용히 사라진다.
+    실제 파일에서 42개 제출이 7개로 줄어 29개 팀-레포가 증발했다.
+    한 팀 안에서의 중복(프론트·백엔드에 같은 주소)은 그대로 걸러야 한다.
+    """
+    path = tempfile.mktemp(suffix=".xlsx")
+    _make_xlsx(path, [
+        ["대학명", "팀명", "GitHub BE", "GitHub FE"],
+        ["OO대", "알파팀", "https://github.com/shared/repo",
+         "https://github.com/shared/repo"],                    # 한 팀 안 중복
+        ["XX대", "베타팀", "https://github.com/shared/repo", ""],  # 다른 팀, 같은 레포
+    ])
+    rows, _ = load_repos(path)
+    got = [(t, o, n) for t, o, n, _ in rows]
+    assert len(got) == 2, f"팀별로 하나씩 남아야 한다: {got}"
+    assert ("OO대 · 알파팀", "shared", "repo") in got, got
+    assert ("XX대 · 베타팀", "shared", "repo") in got, got
+
+
+def test_xlsx_empty_cells_do_not_shift_columns():
+    """빈 셀은 XML에 아예 없다. 순서대로 담으면 열이 밀린다.
+
+    밀리면 머리글로 잡은 '팀명' 열이 엉뚱한 값을 가리키는데,
+    리포트가 그럴듯해 보여서 틀린 줄도 모른다.
+    """
+    import zipfile
+    from xml.sax.saxutils import escape
+    path = tempfile.mktemp(suffix=".xlsx")
+    # A1,B1,C1 머리글 / 2행은 B가 통째로 빠지고 A,C만 있다
+    shared = ["대학명", "팀명", "레포", "OO대", "https://github.com/x/y"]
+    sheet = ('<?xml version="1.0"?><worksheet xmlns="http://schemas.'
+             'openxmlformats.org/spreadsheetml/2006/main"><sheetData>'
+             '<row r="1"><c r="A1" t="s"><v>0</v></c>'
+             '<c r="B1" t="s"><v>1</v></c><c r="C1" t="s"><v>2</v></c></row>'
+             '<row r="2"><c r="A2" t="s"><v>3</v></c>'
+             '<c r="C2" t="s"><v>4</v></c></row>'   # B2 없음
+             '</sheetData></worksheet>')
+    ss = ('<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org'
+          f'/spreadsheetml/2006/main" count="{len(shared)}">'
+          + "".join(f"<si><t>{escape(x)}</t></si>" for x in shared) + "</sst>")
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("xl/sharedStrings.xml", ss)
+        z.writestr("xl/worksheets/sheet1.xml", sheet)
+    rows, _ = load_repos(path)
+    # 팀명(B열)이 비었으므로 대학명만 남아야 한다. 열이 밀리면
+    # 주소가 팀명 자리로 들어와 라벨이 URL이 된다.
+    assert rows and rows[0][0] == "OO대", rows
+    assert (rows[0][1], rows[0][2]) == ("x", "y"), rows
 
 
 def test_xlsx_reads_hyperlink_target():

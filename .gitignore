@@ -1,6 +1,13 @@
 .env
 __pycache__/
 *.pyc
+
+# 학생 제출 목록·결과 — 팀명과 레포 주소가 들어간다
+*.xlsx
+*.xlsm
+*.csv
+repos.txt
 snapshot*.json
 report*.md
-repos.txt
+result*
+!repos.example.txt
