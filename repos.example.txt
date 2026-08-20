@@ -1,0 +1,4 @@
+# 팀명, 레포주소들 (팀명 생략 가능)
+# 예시:
+# 멋사팀, https://github.com/team/front, https://github.com/team/back
+# https://github.com/other/repo
