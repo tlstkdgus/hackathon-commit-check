@@ -15,8 +15,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from check import (KST, judge, load_repos, mark_shared_repos,
-                   parse_repo_url, parse_time)
+from check import (KST, find_repo_urls, is_excluded, judge, load_repos,
+                   mark_shared_repos, parse_repo_url, parse_time)
 
 DEADLINE = datetime.datetime(2026, 8, 21, 10, 0, 0, tzinfo=KST)
 
@@ -63,6 +63,92 @@ def test_url_rejects_slashy_text():
     for raw in ["제출 마감 8/21 09:59:59", "8/21", "확인 완료/미완료",
                 "OO대/XX대 공동", "2026/08/21", "https://github.com/한글/레포"]:
         assert parse_repo_url(raw) is None, raw
+
+
+def test_url_with_note_appended():
+    """주소 뒤에 설명을 붙여 낸 팀 — `.../frontend(프론트엔드)`.
+
+    실제 4회차 제출에서 나왔다. 괄호를 이름의 일부로 읽으면 그 팀은
+    레포가 하나도 안 잡혀 검사에서 통째로 빠진다.
+    """
+    assert parse_repo_url(
+        "https://github.com/0-SEAM/frontend(프론트엔드)") == ("0-SEAM", "frontend")
+
+
+def test_repo_name_may_start_with_hyphen():
+    """레포 이름은 계정과 규칙이 다르다 — `-MORU`처럼 하이픈으로 시작할 수 있다."""
+    assert parse_repo_url(
+        "https://github.com/seunghyeon-L/-MORU") == ("seunghyeon-L", "-MORU")
+    # 계정은 하이픈으로 시작할 수 없다
+    assert parse_repo_url("https://github.com/-owner/repo") is None
+
+
+def test_two_repos_in_one_cell():
+    """한 칸에 프론트·백엔드를 나란히 적은 팀. 뒤엣것이 사라지면 안 된다."""
+    got = find_repo_urls("https://github.com/t/front https://github.com/t/back")
+    assert [g[0] for g in got] == [("t", "front"), ("t", "back")]
+
+
+def test_repo_after_deploy_url_in_same_cell():
+    """`배포주소, 레포주소` 순으로 적으면 앞의 것만 보고 포기하면 안 된다."""
+    got = find_repo_urls("https://campus.onrender.com/, https://github.com/p/campus.git")
+    assert [g[0] for g in got] == [("p", "campus")]
+
+
+def test_prose_without_github_stays_empty():
+    """서술형 칸을 훑어도 없는 주소를 만들어내지 않는다."""
+    assert find_repo_urls("우리 팀은 8/21 09:59에 제출했고 확인 완료/미완료") == []
+
+
+def test_exclude_matches_whole_field_only():
+    """제외는 칸 단위로 정확히 같을 때만. 부분 일치면 진짜 팀이 딸려 나간다.
+
+    `--exclude 멋쟁이사자처럼`으로 운영 계정 테스트 제출을 뺐더니
+    '충남대 멋쟁이사자처럼 3팀'까지 검사에서 사라진 적이 있다.
+    """
+    pat = ["멋쟁이사자처럼"]
+    assert is_excluded("멋쟁이사자처럼 · 멋쟁이사자처럼", pat)
+    assert not is_excluded("충남대학교 · 충남대 멋쟁이사자처럼 3팀", pat)
+    assert not is_excluded("숙명여자대학교 · 금연한사자처럼", pat)
+    # 못 읽은 행은 칸이 쉼표로 이어 붙어 온다
+    assert is_excluded("멋쟁이사자처럼, 테스트, SJF Track, 테스트12", pat)
+    assert not is_excluded("아무 팀", pat)
+    assert not is_excluded("멋쟁이사자처럼 · 멋쟁이사자처럼", [])
+
+
+def test_compare_404_no_common_ancestor_is_a_violation():
+    """두 커밋이 다 살아 있는데 compare가 404 = 공통 조상이 없다.
+
+    브랜치를 아예 다른 히스토리로 갈아치웠다는 뜻이다. 갈아치운 커밋의
+    날짜가 마감 전이면 사후 검사에는 완벽히 정상으로 보인다.
+    '대조 실패'로 뭉뚱그리면 가장 확실한 증거가 [확인필요]에 묻힌다.
+    """
+    import check as C
+    real = C.api
+    try:
+        C.api = lambda path, params=None: ({}, {})   # 두 커밋 다 존재
+        assert C._why_compare_failed("o", "r", "a" * 40, "b" * 40)[0] == "위반"
+
+        def gone(path, params=None):
+            raise C.NotFound(path)
+        C.api = gone                                  # 스냅샷 커밋이 사라짐
+        g, why = C._why_compare_failed("o", "r", "a" * 40, "b" * 40)
+        assert g == "위반" and "사라" in why
+    finally:
+        C.api = real
+
+
+def test_compare_404_stays_cautious_when_unsure():
+    """조회 자체가 안 되면 단정하지 않는다. 억울한 위반보다 확인이 낫다."""
+    import check as C
+    real = C.api
+    try:
+        def boom(path, params=None):
+            raise RuntimeError("network")
+        C.api = boom
+        assert C._why_compare_failed("o", "r", "a" * 40, "b" * 40)[0] == "확인필요"
+    finally:
+        C.api = real
 
 
 def test_url_keeps_case():
@@ -342,12 +428,33 @@ def test_backdated_commit_is_flagged():
 def test_private_repo_flagged():
     """Public 유지가 제출 요건이라 비공개는 그 자체로 확인 대상이다."""
     g, s, _ = judge(_info(private=True, pushed_at="2026-08-01T00:00:00Z"), DEADLINE)
-    assert g == "확인필요" and "비공개" in s
+    assert g == "비공개" and "비공개" in s
+
+
+def test_private_gets_its_own_grade_not_error():
+    """비공개와 오타는 운영진이 할 일이 다르다.
+
+    오타는 팀에 주소를 다시 받으면 되지만 비공개는 규정 위반이다.
+    한 칸에 섞어 놓으면 600행에서 골라내지 못한다.
+    """
+    g, s, lines = judge(
+        _info(ok=False, maybe_private=True,
+              err="비공개로 보임 (계정은 있는데 레포가 안 보임)"), DEADLINE)
+    assert g == "비공개" and "비공개" in s
+    assert any("Public" in ln for ln in lines)
 
 
 def test_unreachable_repo():
-    g, s, _ = judge(_info(ok=False, err="접근 불가 (삭제·비공개·오타)"), DEADLINE)
+    """계정마저 없으면 비공개가 아니라 주소가 틀린 것이다."""
+    g, s, _ = judge(_info(ok=False, maybe_private=False,
+                          err="접근 불가 (삭제·오타 — 계정도 안 보임)"), DEADLINE)
     assert g == "오류" and "접근" in s
+
+
+def test_private_outranks_normal_but_not_violation():
+    """정렬 순서 — 위반이 맨 위, 비공개는 오류보다 위, 정상은 맨 아래."""
+    from check import RANK
+    assert RANK["위반"] < RANK["확인필요"] < RANK["비공개"] < RANK["오류"] < RANK["정상"]
 
 
 def test_missing_pushed_at_is_not_a_violation():
