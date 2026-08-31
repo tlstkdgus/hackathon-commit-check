@@ -208,6 +208,10 @@ def api_all(path, params=None, max_pages=20):
 # 이 검사가 없으면 슬래시가 든 아무 문자열이나 레포가 된다 —
 # 엑셀 메모 칸의 "제출 마감 8/21 09:59:59"가 레포로 잡힌 적이 있다.
 _NAME_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# 레포 이름은 계정과 규칙이 다르다 — 하이픈으로 시작할 수 있다(`-MORU`).
+# 계정 규칙을 그대로 쓰면 그런 팀이 조용히 검사에서 빠진다.
+_REPO_OK = re.compile(r"^[A-Za-z0-9._-]+$")
+_REPO_HEAD = re.compile(r"^[A-Za-z0-9._-]+")
 
 
 def parse_repo_url(raw):
@@ -240,9 +244,15 @@ def parse_repo_url(raw):
     if len(parts) < 2:
         return None
     owner, name = parts[0], parts[1]
+    # 주소 뒤에 설명을 붙여 낸 팀이 있다: `.../frontend(프론트엔드)`.
+    # 레포 이름에 못 쓰는 글자가 나오면 거기서 자른다.
+    head = _REPO_HEAD.match(name)
+    name = head.group(0) if head else ""
     if name.lower().endswith(".git"):
         name = name[:-4]
-    if not _NAME_OK.match(owner) or not _NAME_OK.match(name):
+    if not _NAME_OK.match(owner) or not _REPO_OK.match(name):
+        return None
+    if not any(c.isalnum() for c in name):
         return None
     # 호스트가 안 적힌 `owner/repo` 축약형은 글자가 하나라도 있어야 받는다.
     # 안 그러면 엑셀의 날짜 "8/21", "2026/08"이 전부 레포가 된다.
@@ -250,6 +260,34 @@ def parse_repo_url(raw):
                              and any(c.isalpha() for c in name)):
         return None
     return owner, name
+
+
+# 칸 안에 박혀 있는 깃허브 주소. 여는 괄호·따옴표·공백에서 끊는다 —
+# `frontend(프론트엔드)` 같은 꼬리표가 이름에 딸려오지 않게.
+_GH_IN_TEXT = re.compile(
+    r"(?:https?://|ssh://|git://|git@)?(?:www\.)?github\.com[/:][^\s,;()\[\]<>\"']+",
+    re.I)
+
+
+def find_repo_urls(cell):
+    """한 칸에서 레포 주소를 **전부** 찾는다. [((owner, name), 원문)].
+
+    칸 하나에 주소가 하나만 들어 있으리라 기대하면 안 된다. 제출 폼이
+    자유 입력이라 `배포주소, 레포주소`처럼 붙여 적거나 프론트·백엔드를
+    한 칸에 나란히 적은 팀이 있었다. 칸 전체를 URL 하나로 보고 파싱하면
+    앞의 것만 잡히고 **뒤의 레포는 통째로 사라진다** — 그 팀은 검사에서
+    빠지고도 경고조차 안 뜬다.
+    """
+    out, seen = [], set()
+    for m in _GH_IN_TEXT.finditer(cell):
+        got = parse_repo_url(m.group(0))
+        if got and got not in seen:
+            seen.add(got)
+            out.append((got, m.group(0)))
+    if out:
+        return out
+    got = parse_repo_url(cell)      # 호스트 없는 `owner/repo` 축약형
+    return [(got, cell.strip())] if got else []
 
 
 _XL = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
@@ -377,6 +415,20 @@ def _header_columns(cells):
     return team, school
 
 
+def is_excluded(text, patterns):
+    """대학명·팀명이 patterns 중 하나와 **정확히** 같은지.
+
+    부분 일치로 하면 안 된다. `--exclude 멋쟁이사자처럼`이 운영 계정의
+    테스트 제출뿐 아니라 '충남대 멋쟁이사자처럼 3팀' 같은 진짜 팀까지
+    쓸어간다 — 실제로 그렇게 한 팀이 조용히 검사에서 빠졌다.
+    그래서 칸 단위로 끊어 통째로 같을 때만 뺀다.
+    """
+    if not patterns:
+        return False
+    fields = [f.strip() for part in text.split(" · ") for f in part.split(",")]
+    return any(f in patterns for f in fields)
+
+
 def load_repos(path):
     """입력 파일 → [(팀, owner, name, 원문)].
 
@@ -409,17 +461,18 @@ def load_repos(path):
             label = " · ".join(parts)
         if not label:
             for c in filled:
-                if not c.isdigit() and not parse_repo_url(c):
+                if not c.isdigit() and not find_repo_urls(c):
                     label = c
                     break
 
-        urls = [c for c in filled if parse_repo_url(c)]
-        if not urls:
+        found = []
+        for c in filled:
+            found += find_repo_urls(c)
+        if not found:
             if _looks_like_attempt(filled):
                 bad.append((lineno, ", ".join(filled)[:100]))
             continue
-        for u in urls:
-            owner, name = parse_repo_url(u)
+        for (owner, name), u in found:
             key = (label, owner.lower(), name.lower())
             if key in seen:
                 continue
@@ -449,16 +502,48 @@ def fetch(owner, name, deadline, want_commits=True):
     return info
 
 
+_owner_cache = {}
+
+
+def _owner_exists(owner):
+    """깃허브 계정(사용자·조직)이 실제로 있는지. 404 원인을 좁히는 데만 쓴다.
+
+    레포가 404일 때 '비공개'와 '주소 오타'를 갈라 보려는 것이다. 확실한
+    구분은 불가능하지만 — 비공개 레포는 남에게 404로 보이므로 —
+    계정마저 없으면 오타 쪽이 거의 확실하다.
+    """
+    key = owner.lower()
+    with _cache_lock:
+        if key in _owner_cache:
+            return _owner_cache[key]
+    try:
+        api(f"/users/{owner}")
+        found = True
+    except NotFound:
+        found = False
+    except Exception:
+        found = False       # 판단이 안 서면 '비공개'로 몰지 않는다
+    with _cache_lock:
+        _owner_cache[key] = found
+    return found
+
+
 def _fetch_uncached(owner, name, deadline, want_commits=True):
     info = {"owner": owner, "name": name, "ok": False, "err": None,
             "private": None, "default_branch": None, "pushed_at": None,
             "branches": {}, "commits": [], "seen_at": None,
-            "truncated": []}
+            "truncated": [], "maybe_private": False}
     try:
         repo, _ = api(f"/repos/{owner}/{name}")
     except NotFound:
         # 삭제됐거나 비공개거나 오타. 토큰 권한 밖의 비공개 레포도 404다.
-        info["err"] = "접근 불가 (삭제·비공개·오타)"
+        # 계정이 살아 있으면 비공개 쪽에 무게가 실린다 — 주소를 잘못 적은
+        # 경우는 보통 계정 이름부터 틀리기 때문이다. 404가 난 레포에만
+        # 한 번 더 물으므로 호출은 거의 늘지 않고, 같은 계정은 캐시한다.
+        info["maybe_private"] = _owner_exists(owner)
+        info["err"] = ("비공개로 보임 (계정은 있는데 레포가 안 보임)"
+                       if info["maybe_private"]
+                       else "접근 불가 (삭제·오타 — 계정도 안 보임)")
         return info
     except Exception as e:
         info["err"] = f"조회 실패: {type(e).__name__} {e}"
@@ -568,9 +653,14 @@ def judge(info, deadline):
     리베이스·머지처럼 악의 없는 원인으로도 시각이 밀리기 때문이다.
     """
     if not info["ok"]:
+        # 비공개는 '오류'가 아니다. 주소 오타는 고쳐 달라고 하면 되지만
+        # 비공개는 팀이 규정을 어긴 것이라 운영진이 볼 목록이 다르다.
+        if info.get("maybe_private"):
+            return "비공개", info["err"], [
+                "→ Public으로 바꿔야 검사할 수 있음 (계정은 확인됨)"]
         return "오류", info["err"], []
     if info["private"]:
-        return "확인필요", "비공개 레포 (Public 유지 필수)", []
+        return "비공개", "비공개 레포 (Public 유지 필수)", []
 
     pushed = parse_time(info["pushed_at"])
 
@@ -605,14 +695,81 @@ def judge(info, deadline):
 
 # ── 스냅샷 대조 ──────────────────────────────────────────────────
 
+def _commit_exists(owner, name, sha):
+    try:
+        api(f"/repos/{owner}/{name}/commits/{sha}")
+        return True
+    except NotFound:
+        return False
+    except Exception:
+        return None        # 모르겠으면 단정하지 않는다
+
+
+def _commit_date(owner, name, sha):
+    """커밋 하나의 커밋 시각. 못 읽으면 None."""
+    try:
+        c, _ = api(f"/repos/{owner}/{name}/commits/{sha}")
+        return c.get("commit", {}).get("committer", {}).get("date")
+    except Exception:
+        return None
+
+
+def _why_compare_failed(owner, name, old_sha, new_sha):
+    """compare가 404일 때 원인을 좁힌다 → (등급, 설명).
+
+    두 갈래뿐이다.
+
+    - 스냅샷 커밋이 사라졌다 → 히스토리를 잘라낸 force-push.
+    - 둘 다 살아 있는데 404 → **공통 조상이 없다.** 브랜치를 아예 다른
+      히스토리로 갈아치웠다는 뜻이다. 갈아치운 커밋의 날짜가 마감 전이면
+      사후 검사에는 완벽히 정상으로 보인다. 대조만이 잡을 수 있다.
+    """
+    old_ok = _commit_exists(owner, name, old_sha)
+    if old_ok is False:
+        return "위반", "스냅샷 커밋이 사라짐 — force-push로 이력이 잘렸다"
+    new_ok = _commit_exists(owner, name, new_sha)
+    if old_ok and new_ok:
+        return "위반", "이력이 통째로 갈림 — 공통 조상이 없다 (브랜치 교체)"
+    return "확인필요", "대조 실패 — 원인을 좁히지 못했다"
+
+
 def compare_one(owner, name, before, deadline):
     """스냅샷 이후 브랜치가 어떻게 변했는지. force-push까지 잡는 경로다."""
     now = fetch(owner, name, deadline, want_commits=False)
     if not now["ok"]:
+        if now.get("maybe_private"):
+            # 스냅샷에는 잡혔는데 지금은 안 보인다 = 마감 후에 비공개로
+            # 돌린 것이다. 삭제·오타와 달리 제출 후 상태를 바꾼 흔적이라
+            # 따로 세야 한다.
+            if before.get("ok"):
+                return "비공개", "스냅샷 이후 비공개로 전환됨", [
+                    f"스냅샷에는 공개 상태였음 "
+                    f"(브랜치 {len(before.get('branches') or {})}개, "
+                    f"마지막 푸시 {fmt(parse_time(before.get('pushed_at')))})",
+                    "→ 마감 후 Public → Private 전환. 직접 확인 필요",
+                ]
+            return "비공개", now["err"], []
         return "오류", now["err"], []
+
+    # 스냅샷 당시 비공개였던 레포는 브랜치가 하나도 안 찍혔다. 그 상태로
+    # 대조하면 지금 보이는 브랜치가 전부 '마감 후에 새로 생긴 것'으로
+    # 둔갑한다 — 실제로 마감 전 커밋만 있는 두 팀이 그렇게 지목됐다.
+    # 비교할 과거가 없다는 사실을 그대로 말하는 게 맞다.
+    if not before.get("ok") and not (before.get("branches") or {}):
+        pushed = parse_time(now.get("pushed_at"))
+        lines = [f"스냅샷 시점에는 비공개여서 브랜치를 못 받았음",
+                 f"현재 공개 · 브랜치 {len(now['branches'])}개 · "
+                 f"마지막 푸시 {fmt(pushed)}"]
+        if pushed and pushed >= deadline:
+            lines.append("→ 마지막 푸시가 마감 후다. 직접 확인 필요")
+            return "확인필요", "비공개였다 공개됨 — 마감 후 푸시 있음", lines
+        lines.append("→ 마지막 푸시가 마감 전이라 마감 후 변경은 확인되지 않음")
+        lines.append("→ 다만 비공개 구간은 대조할 과거가 없어 검증 불가")
+        return "확인필요", "비공개였다 공개됨 — 대조할 스냅샷이 없음", lines
 
     old, new = before.get("branches", {}), now["branches"]
     lines, worst = [], "정상"
+    private_now = bool(now.get("private"))
 
     # 600개를 찍는 데 몇 분이 걸리므로 마감(10:00)과 스냅샷 사이에 사각지대가
     # 생긴다. 그 틈에 푸시한 팀은 '수정 후' 상태로 스냅샷에 들어가 대조로는
@@ -633,6 +790,15 @@ def compare_one(owner, name, before, deadline):
             continue
         try:
             cmp_, _ = api(f"/repos/{owner}/{name}/compare/{old_sha}...{new[b]}")
+        except NotFound:
+            # compare가 404를 내는 경우는 둘이다. 어느 쪽인지 가려야 한다 —
+            # '대조 실패'로 뭉뚱그리면 가장 확실한 force-push 증거가
+            # [확인필요] 한 줄에 묻힌다. 실제로 두 팀이 그렇게 묻혀 있었다.
+            grade, why = _why_compare_failed(owner, name, old_sha, new[b])
+            lines.append(f"[{b}] {why} (스냅샷 {old_sha[:8]} → 현재 {new[b][:8]})")
+            if grade == "위반" or worst != "위반":
+                worst = grade
+            continue
         except Exception as e:
             lines.append(f"[{b}] {old_sha[:8]} → {new[b][:8]} (대조 실패: {e})")
             if worst != "위반":
@@ -660,9 +826,24 @@ def compare_one(owner, name, before, deadline):
 
     for b in new:
         if b not in old:
-            lines.append(f"[{b}] 마감 후 새 브랜치 생성 ({new[b][:8]})")
+            # 브랜치가 새로 보인다고 마감 후에 만든 것은 아니다. 끝 커밋이
+            # 마감 전이면 마감 전 작업을 가리키는 브랜치일 뿐이다.
+            tip = parse_time(_commit_date(owner, name, new[b]))
+            when = f", 끝 커밋 {fmt(tip)}" if tip else ""
+            if tip and tip < deadline:
+                lines.append(f"[{b}] 스냅샷에 없던 브랜치 ({new[b][:8]}{when} — 마감 전)")
+            else:
+                lines.append(f"[{b}] 마감 후 새 브랜치 생성 ({new[b][:8]}{when})")
             if worst == "정상":
                 worst = "확인필요"
+
+    if private_now:
+        # 토큰으로 볼 수 있는 비공개 레포. 대조는 그대로 하되 비공개라는
+        # 사실을 근거에 남긴다. 위반이 함께 잡혔으면 그쪽이 더 급하다.
+        lines.insert(0, "현재 비공개 레포 (Public 유지 필수)")
+        if worst in ("정상", "확인필요"):
+            return "비공개", ("비공개 레포, 스냅샷과 동일" if worst == "정상"
+                              else "비공개 레포, 스냅샷 이후 변경 있음"), lines
 
     if worst == "정상":
         return "정상", "스냅샷과 동일", []
@@ -712,8 +893,9 @@ def mark_shared_repos(results):
 
 # ── 리포트 ───────────────────────────────────────────────────────
 
-RANK = {"위반": 0, "확인필요": 1, "오류": 2, "정상": 3}
-MARK = {"위반": "[위반]", "확인필요": "[확인]", "오류": "[오류]", "정상": "[정상]"}
+RANK = {"위반": 0, "확인필요": 1, "비공개": 2, "오류": 3, "정상": 4}
+MARK = {"위반": "[위반]", "확인필요": "[확인]", "비공개": "[비공개]",
+        "오류": "[오류]", "정상": "[정상]"}
 
 
 def report(results, deadline, mode):
@@ -761,6 +943,24 @@ def report(results, deadline, mode):
     return "\n".join(out)
 
 
+def write_json(path, results, deadline, mode):
+    """결과를 구조 그대로. CSV는 근거를 ' / '로 이어 붙여 되읽을 수 없다 —
+    근거 줄 자체에 '/'가 들어가면(`→ 브랜치 삭제 / force-push`) 쪼갤 때
+    깨진다. 다른 도구가 결과를 다시 읽어야 하면 이쪽을 쓴다.
+    """
+    data = {
+        "mode": mode,
+        "deadline": deadline.isoformat(),
+        "generated_at": datetime.datetime.now(KST).isoformat(),
+        "results": [{"grade": g, "team": t, "repo": r,
+                     "summary": s, "lines": list(ln)}
+                    for g, t, r, s, ln in sorted(
+                        results, key=lambda x: (RANK[x[0]], str(x[1])))],
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+
+
 def write_csv(path, results):
     """600행은 눈으로 못 읽는다. 정렬·필터·담당자 분배는 스프레드시트에서."""
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
@@ -805,6 +1005,7 @@ def do_snapshot(rows, deadline, path, workers, resume):
         info = fetch(owner, name, deadline, want_commits=False)
         rec = {"team": team, "owner": owner, "name": name, "ok": info["ok"],
                "err": info["err"], "private": info["private"],
+               "maybe_private": info.get("maybe_private", False),
                "pushed_at": info["pushed_at"], "seen_at": info["seen_at"],
                "default_branch": info["default_branch"],
                "branches": info["branches"]}
@@ -828,9 +1029,24 @@ def do_snapshot(rows, deadline, path, workers, resume):
           f"브랜치 {sum(len(r.get('branches') or {}) for r in collected)}개")
     print(f"  소요 {took:.0f}초 ({started:%H:%M:%S} ~ "
           f"{datetime.datetime.now(KST):%H:%M:%S} KST)")
-    if len(collected) - ok:
-        print(f"  [실패 {len(collected) - ok}개] "
+    priv = [r for r in collected
+            if r.get("private") or r.get("maybe_private")]
+    # 비공개는 다시 받아도 영원히 실패한다. 재시도 대상에서 빼지 않으면
+    # 마감 직후에 되지도 않을 --resume을 반복하며 시간을 버리게 된다.
+    retry = [r for r in collected
+             if not r.get("ok") and not r.get("maybe_private")]
+    if retry:
+        print(f"  [실패 {len(retry)}개] "
               f"`--snapshot {path} --resume`으로 다시 받으세요")
+    if priv:
+        # 비공개는 스냅샷 자체가 비어 있어 나중에 대조해도 아무것도 안 나온다.
+        # 마감 직후 이 자리에서 알려줘야 팀에 연락할 시간이 있다.
+        print(f"  [비공개 {len(priv)}개] 검사 불가 — Public 전환 요청 대상")
+        print("     스냅샷이 비어 있어 나중에 공개로 바꿔도 대조할 게 없습니다.")
+        for r in priv[:10]:
+            print(f"       {r['team']}  {r['owner']}/{r['name']}")
+        if len(priv) > 10:
+            print(f"       ... 외 {len(priv) - 10}개")
     if late:
         print(f"  [주의] 스냅샷 시점에 이미 마감 후 푸시가 있는 레포 {len(late)}개")
         print("     마감과 스냅샷 사이에 들어온 푸시라 대조로는 안 잡힙니다.")
@@ -879,6 +1095,10 @@ def main():
                    help=f"동시 실행 수 (기본 {DEFAULT_WORKERS})")
     p.add_argument("-o", "--out", help="리포트를 파일로도 저장")
     p.add_argument("--csv", help="결과를 CSV로 저장 (600개는 스프레드시트가 편하다)")
+    p.add_argument("--json", help="결과를 JSON으로 저장 (근거 줄이 안 깨진다)")
+    p.add_argument("--exclude", action="append", default=[], metavar="문자열",
+                   help="대학명·팀명에 이 문자열이 들어간 행은 검사에서 뺀다. "
+                        "여러 번 지정 가능 (예: --exclude 멋쟁이사자처럼)")
     args = p.parse_args()
 
     deadline = parse_time(args.deadline)
@@ -893,6 +1113,16 @@ def main():
             snap = json.load(f)
         before = {(r["owner"], r["name"]): r for r in snap["repos"]}
         rows = [(r["team"], r["owner"], r["name"]) for r in snap["repos"]]
+        # 대조는 스냅샷을 읽지 입력 파일을 읽지 않는다. 여기서도 걸러주지
+        # 않으면 --exclude가 사후 검사에서만 듣고 대조에서는 조용히
+        # 무시되어, 뺐다고 생각한 행이 다시 올라온다.
+        if args.exclude:
+            keep = [r for r in rows
+                    if not is_excluded(r[0], args.exclude)]
+            print(f"제외: {', '.join(args.exclude)} — "
+                  f"{len(rows) - len(keep)}건을 대조에서 뺐습니다",
+                  file=sys.stderr)
+            rows = keep
         print(f"스냅샷 {args.compare} ({snap['taken_at'][:19]}) 대조 — "
               f"{len(rows)}개, 동시 {args.workers}\n", file=sys.stderr)
 
@@ -920,6 +1150,20 @@ def main():
                         + ", ".join(cands)
                         + "  ->  하나를 지정해주세요: python check.py 파일이름")
         rows, bad = load_repos(source)
+
+        # 운영 계정의 테스트 제출처럼 애초에 검사 대상이 아닌 행이 섞여 온다.
+        # 리포트에 남겨두면 [비공개]·[오류] 칸에 앉아 진짜 건과 헷갈린다.
+        # 몇 건을 뺐는지는 반드시 찍는다 — 조용히 사라지면 빼먹은 줄도 모른다.
+        if args.exclude:
+            def dropped(text):
+                return is_excluded(text, args.exclude)
+            keep = [r for r in rows if not dropped(r[0])]
+            kept_bad = [b for b in bad if not dropped(b[1])]
+            n = (len(rows) - len(keep)) + (len(bad) - len(kept_bad))
+            print(f"제외: {', '.join(args.exclude)} — {n}건을 검사에서 뺐습니다",
+                  file=sys.stderr)
+            rows, bad = keep, kept_bad
+
         for lineno, line in bad:
             print(f"경고: {lineno}행을 읽지 못했습니다 — {line}", file=sys.stderr)
         if not rows:
@@ -964,6 +1208,10 @@ def main():
     if args.csv:
         write_csv(args.csv, results)
         print(f"CSV 저장: {args.csv}", file=sys.stderr)
+    if args.json:
+        write_json(args.json, results, deadline,
+                   "스냅샷 대조" if args.compare else "사후 검사")
+        print(f"JSON 저장: {args.json}", file=sys.stderr)
     return 1 if any(g == "위반" for g, *_ in results) else 0
 
 

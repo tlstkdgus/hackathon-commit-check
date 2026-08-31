@@ -9,5 +9,14 @@ __pycache__/
 repos.txt
 snapshot*.json
 report*.md
+핸드오프*.md
 result*
 !repos.example.txt
+일일검사/
+재검사*
+스냅샷*.json
+창내커밋*
+창대조*
+창후스캔*
+심사/
+구간감사*
